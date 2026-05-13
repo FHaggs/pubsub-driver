@@ -19,10 +19,20 @@
 
 #define TOPIC_NAME_SIZE 64
 #define BUFFER_SIZE 1024
+#define DEFAULT_MAX_SUBSCRIBERS 10
+
+// Module parameters
+static int max_topics = 32;
+module_param(max_topics, int, 0444);
+MODULE_PARM_DESC(max_topics, "Maximum number of topics (not modifiable at runtime)");
 
 // Use mod probe to load this
 
 // ============================================================
+
+static struct kobject *pubsub_kobj;
+static const struct attribute_group topic_attr_group;
+
 // Shared state
 // ============================================================
 
@@ -31,6 +41,8 @@ struct broker {
 
 	struct list_head topics;
 	struct list_head listeners;
+	
+	int topic_count;
 };
 
 struct topic;
@@ -77,6 +89,10 @@ struct topic {
 	wait_queue_head_t readers_wait;
 
 	struct list_head subscribers;
+	
+	size_t message_count;
+	int max_subscribers;
+	struct kobject *kobj;
 
 	struct list_head list;
 };
@@ -133,9 +149,21 @@ static int add_subscription_to_topic(struct listener_state *listener,
 {
 	struct listener_subscription *subscription;
 	struct subscriber *subscriber;
+	int subscriber_count = 0;
+	struct subscriber *s;
 
 	if (find_listener_subscription(listener, topic)) {
 		return 0;
+	}
+
+	// Check if adding a new subscriber would exceed max_subscribers
+	list_for_each_entry(s, &topic->subscribers, list) {
+		subscriber_count++;
+	}
+
+	if (subscriber_count >= topic->max_subscribers) {
+		pr_warn("pubsub: Max subscribers limit reached for topic '%s'\n", topic->name);
+		return -ENOSPC;
 	}
 
 	subscriber = kmalloc(sizeof(*subscriber), GFP_KERNEL);
@@ -251,6 +279,7 @@ static int publish_message_to_topic(struct topic *topic, const char *message, si
 	// Update write_pos atomically (write_pos grows monotonically, NEVER wraps around)
 	spin_lock(&topic->write_pos_lock);
 	topic->write_pos += record_len;
+	topic->message_count++;
 	spin_unlock(&topic->write_pos_lock);
 
 	return 0;
@@ -492,7 +521,14 @@ static int subscribe_listener_to_topic(struct file *file, const char *topic_name
 	mutex_lock(&global_broker.topics_lock);
 	topic = find_topic_by_name(topic_name);
 	if (!topic) {
-		topic = kmalloc(sizeof(*topic), GFP_KERNEL);
+		// Check if we've reached max topics limit
+		if (global_broker.topic_count >= max_topics) {
+			pr_warn("pubsub: Max topics limit (%d) reached\n", max_topics);
+			ret = -ENOSPC;
+			goto out_unlock;
+		}
+
+		topic = kzalloc(sizeof(*topic), GFP_KERNEL);
 		if (!topic) {
 			ret = -ENOMEM;
 			goto out_unlock;
@@ -514,11 +550,32 @@ static int subscribe_listener_to_topic(struct file *file, const char *topic_name
 
 		topic->capacity = BUFFER_SIZE;
 		topic->write_pos = 0;
+		topic->message_count = 0;
+		topic->max_subscribers = DEFAULT_MAX_SUBSCRIBERS;
 		spin_lock_init(&topic->write_pos_lock);
 		mutex_init(&topic->write_lock);
 		init_waitqueue_head(&topic->readers_wait);
 		INIT_LIST_HEAD(&topic->subscribers);
+		
+		/* Create /sys/.../<topic>/max_subscribers */
+		topic->kobj = kobject_create_and_add(topic_name, pubsub_kobj);
+		if (!topic->kobj) {
+			ret = -ENOMEM;
+			kfree(topic->buffer);
+			kfree(topic);
+			goto out_unlock;
+		}
+
+		ret = sysfs_create_group(topic->kobj, &topic_attr_group);
+		if (ret) {
+			kobject_put(topic->kobj);
+			kfree(topic->buffer);
+			kfree(topic);
+			goto out_unlock;
+		}
+
 		list_add_tail(&topic->list, &global_broker.topics);
+		global_broker.topic_count++;
 	}
 
 	ret = add_subscription_to_topic(listener, topic);
@@ -555,6 +612,18 @@ static int unsubscribe_listener_from_topic(struct file *file, const char *topic_
 	}
 
 	remove_subscription_locked(listener, subscription);
+
+	// Check if there are any subscribers left for this topic
+	if (list_empty(&topic->subscribers)) {
+		// No more subscribers, destroy the topic
+		list_del(&topic->list);
+		sysfs_remove_group(topic->kobj, &topic_attr_group);
+		kobject_put(topic->kobj);
+		kfree(topic->buffer);
+		kfree(topic);
+		global_broker.topic_count--;
+	}
+
 	ret = 0;
 
 out_unlock:
@@ -682,6 +751,14 @@ static struct proc_dir_entry *proc_entry;
 
 static int my_proc_show(struct seq_file *m, void *v)
 {
+	struct topic *topic;
+
+	mutex_lock(&global_broker.topics_lock);
+	list_for_each_entry(topic, &global_broker.topics, list) {
+		seq_printf(m, "%s: %zu\n", topic->name, topic->message_count);
+	}
+	mutex_unlock(&global_broker.topics_lock);
+
 	return 0;
 }
 
@@ -706,6 +783,62 @@ static const struct proc_ops my_proc_ops = {
 };
 
 // ============================================================
+// sysfs attributes for topics
+// ============================================================
+
+static ssize_t max_subscribers_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+	struct topic *topic;
+	ssize_t ret;
+
+	mutex_lock(&global_broker.topics_lock);
+	topic = find_topic_by_name(kobject_name(kobj));
+	if (!topic) {
+		ret = -ENOENT;
+	} else {
+		ret = sysfs_emit(buf, "%d\n", topic->max_subscribers);
+	}
+	mutex_unlock(&global_broker.topics_lock);
+
+	return ret;
+}
+
+static ssize_t max_subscribers_store(struct kobject *kobj, struct kobj_attribute *attr,
+				     const char *buf, size_t count)
+{
+	struct topic *topic;
+	int new_max;
+
+	if (kstrtoint(buf, 10, &new_max) < 0 || new_max <= 0)
+		return -EINVAL;
+
+	mutex_lock(&global_broker.topics_lock);
+	topic = find_topic_by_name(kobject_name(kobj));
+	if (!topic) {
+		mutex_unlock(&global_broker.topics_lock);
+		return -ENOENT;
+	}
+
+	topic->max_subscribers = new_max;
+	mutex_unlock(&global_broker.topics_lock);
+
+	return count;
+}
+
+static struct kobj_attribute max_subscribers_attr = __ATTR(max_subscribers, 0644,
+							   max_subscribers_show,
+							   max_subscribers_store);
+
+static struct attribute *topic_attrs[] = {
+	&max_subscribers_attr.attr,
+	NULL,
+};
+
+static const struct attribute_group topic_attr_group = {
+	.attrs = topic_attrs,
+};
+
+// ============================================================
 // module init
 // ============================================================
 
@@ -714,6 +847,7 @@ static void init_broker(void)
 	mutex_init(&global_broker.topics_lock);
 	INIT_LIST_HEAD(&global_broker.topics);
 	INIT_LIST_HEAD(&global_broker.listeners);
+	global_broker.topic_count = 0;
 }
 
 static int __init my_init(void)
@@ -793,11 +927,30 @@ static int __init my_init(void)
 
 		return -ENOMEM;
 	}
+
+	// --------------------------------------------------------
+	// create sysfs directory
+	// --------------------------------------------------------
+
+	pubsub_kobj = kobject_create_and_add("pubsub", NULL);
+	if (!pubsub_kobj) {
+		pr_err("kobject_create_and_add failed\n");
+
+		proc_remove(proc_entry);
+		device_destroy(my_class, dev_num);
+		class_destroy(my_class);
+		cdev_del(&my_cdev);
+		unregister_chrdev_region(dev_num, 1);
+
+		return -ENOMEM;
+	}
+
 	init_broker();
 
 	pr_info("pubsub loaded\n");
 	pr_info("/dev/%s created\n", DEVICE_NAME);
 	pr_info("/proc/%s created\n", PROC_NAME);
+	pr_info("max_topics parameter: %d\n", max_topics);
 
 	return 0;
 }
@@ -808,6 +961,21 @@ static int __init my_init(void)
 
 static void __exit my_exit(void)
 {
+	struct topic *topic;
+	struct topic *tmp;
+
+	// Remove all topics from sysfs
+	mutex_lock(&global_broker.topics_lock);
+	list_for_each_entry_safe(topic, tmp, &global_broker.topics, list) {
+		list_del(&topic->list);
+		sysfs_remove_group(topic->kobj, &topic_attr_group);
+		kobject_put(topic->kobj);
+		kfree(topic->buffer);
+		kfree(topic);
+	}
+	mutex_unlock(&global_broker.topics_lock);
+
+	kobject_put(pubsub_kobj);
 	proc_remove(proc_entry);
 
 	device_destroy(my_class, dev_num);
